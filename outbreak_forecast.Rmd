@@ -1,0 +1,183 @@
+---
+html_document: 
+  keep_md: yes
+author: "Billy Quilty"
+date: "11 April 2018"
+output:
+  html_document:
+    df_print: paged
+title: "Chioggia Virus Outbreak Projections"
+---
+
+```{r include=F}
+library(tidyverse)
+library(knitr)
+library(stats4)
+library (deSolve) 
+library(bbmle)
+opts_chunk$set(tidy=T)
+```
+
+Load updated incidence data:
+
+```{r }
+chioggia <- read.csv("chioggia8.csv")
+colnames(chioggia) <- c("time","incidence")
+```
+
+## SEIIR Model
+
+```{r }
+seiir_model = function (timepoints, initial_values, parameter_list)
+{
+  with (as.list(c(parameter_list, initial_values)), 
+    {
+      if (timepoints<8){ #pre-selfquarantine
+      # compute derivatives
+      dS = -(beta1 * S/N * I1 + beta2 * S/N * I2)
+      dE = beta1 * S/N * I1 + beta2 * S/N * I2 - delta * E
+      dI1 = delta * E - gamma * I1
+      dI2 = gamma * I1 - sigma * I2
+      dR = sigma * I2
+      dcumincidence = I1*gamma
+      
+      # combine results
+      results = c(dS, dE, dI1, dI2, dR, dcumincidence)
+      list(results)
+      
+      } else { #post-selfquarantine
+        dS = -(beta1 * S/N * I1 + beta2 * S/N * quarantine * I2)
+        dE = beta1 * S/N * I1 + beta2 * S/N * quarantine * I2 - delta * E
+        dI1 = delta * E - gamma * I1
+        dI2 = gamma * I1 - sigma * I2
+        dR = sigma * I2
+        dcumincidence = I1*gamma
+        
+        # combine results
+        results = c(dS, dE, dI1, dI2, dR, dcumincidence)
+        list(results)
+      }
+    }
+  )
+}
+```
+
+### Model inputs
+
+```{r }
+rash_period = 1    
+fever_period = 0.43
+latent_period = 0.8    
+
+sigma_value = 1 / rash_period
+gamma_value = 1 / fever_period
+delta_value = 1 / latent_period
+
+prop.quarantined = 0.544 #proportion of those with rash quarantined: 55.5%
+quarantine <- (1-prop.quarantined) #remaining infectives
+
+N = 50000
+
+I_0 = 13 #13 initial infected (rash)
+
+timepoints = seq (1, 100, by=1) #in weeks
+
+initial_values = c(S = N-I_0,
+                   E = 0,
+                   I1 = 0,
+                   I2 = I_0,
+                   R = 0,
+                  cumincidence=0)
+
+parameter_list = c(beta1 = 0.98, #fever transmission rate
+                   beta2 = 1.94, #rash transmission rate
+                   gamma = gamma_value,
+                   sigma=sigma_value,
+                   delta = delta_value,
+                   quarantine)
+
+#solve model
+output = ode(initial_values, timepoints, seiir_model, parameter_list)
+output <- as.data.frame(output)
+
+#convert cumulative incidence to incidence
+predincidence <- c(0,diff(output[, "cumincidence"])) 
+
+output$predincidence <- predincidence
+
+combined <- merge(output,chioggia,by="time",all.x = T)
+
+ggplot(data=combined,aes(x=time))+
+  geom_point(aes(y=incidence,colour="Reported Incidence"))+
+  geom_point(aes(y=predincidence,colour="Predicted Incidence")) + 
+  labs(x="Week",y="Incidence")+
+  scale_colour_manual("",
+                      breaks = c("Reported Incidence","Predicted Incidence"),
+                      values = c("red","black"))
+```
+
+
+## Predicted incidence each week for next 60 weeks:
+
+```{r echo=FALSE}
+table <- combined[40:100,]
+table <- table[,c(1,8)]
+colnames(table) <- c("Week","Predicted Incidence")
+kable(table)
+```
+
+
+**The epidemic will end at around Week 80.**
+
+## Maximum likelihood estimation of transmission rates beta1 and beta 1:
+
+```{r }
+seiirMLE <- function(b1,b2){
+  rash_period = 1
+  fever_period = 0.43
+  latent_period = 0.8  
+  beta1_value = b1
+  beta2_value = b2
+  
+  sigma_value = 1 / rash_period
+  gamma_value = 1 / fever_period
+  delta_value = 1 / latent_period
+  
+  prop.quarantined=0.555
+  quarantine <- (1-prop.quarantined)
+  
+  I_0 = 13 
+
+  N = 50000
+  
+  timepoints = seq (1,100, by=1)
+  
+  initial_values = c(S = N-I_0, 
+                     E = 0, 
+                     I1 = 0,
+                     I2 = I_0, 
+                     R = 0, 
+                     cumincidence=0)
+  
+  parameter_list = c(beta1 = beta1_value,
+                     beta2 = beta2_value,
+                     gamma = gamma_value, 
+                     sigma = sigma_value, 
+                     delta = delta_value,
+                     quarantine)
+  
+  out <- as.data.frame(ode(initial_values,timepoints,seiir_model,parameter_list))
+  predincidence <- c(0, diff(out[, "cumincidence"]))
+  out$predincidence <- predincidence
+  ML <- -sum(dpois(x=chioggia$incidence,lambda=out$predincidence),log=T)
+}
+```
+
+Estimates for beta by MLE
+
+```{r }
+fit <- mle2(seiirMLE,start=list(b1=1,b2=2),
+            method = "L-BFGS-B", lower = c(0.01, 0.01),upper = c(Inf,Inf));summary(fit)
+
+```
+
